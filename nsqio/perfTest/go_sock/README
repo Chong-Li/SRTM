@@ -1,0 +1,12 @@
+Compile the code with command
+./make.py
+
+Run TCP with default setting, 5000000 packets send in full speed, 10000 latency records.
+Run the scripts in two machine
+On machine A: $./TCPServer
+On machine B: $./TCPClient -a <machine A IP>
+
+
+Run UDP with default setting,
+On machine A: $./UDPServer
+On machine B: $./UDPClient -a <machine A IP>

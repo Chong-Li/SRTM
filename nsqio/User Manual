@@ -1,0 +1,74 @@
+Run RTM step-by-step:
+
+* Run " go get github.com/WU-CPSL/RTM-0.1/... " (it does not matter if you have
+  any compiling error at this step).
+* Run " go install -tags nsq(or rtm) github.com/WU-CPSL/RTM-0.1/nsqio/nsq/... ", which compiles
+  our message daemon, client-library, lookup daemon. Using tag "nsq" will
+  compile message daemon and client-library without rate control. To enable
+  rate control, use tag "rtm" when compiling.
+* Run " go install -tags nsq(or rtm) github.com/WU-CPSL/RTM-0.1/nsqio/Test/... ", which
+  compiles our test programs.
+* Go to test script directories Test/run-test
+* Run " $GOPATH/bin/nsqlookupd [-multicast_flag]" to initiate the lookup daemon. Flag multicast_flag is added when you want to enable multicast.
+* Run " sh daemon_create.sh " to create messaging daemon(s). This script
+  creates two daemons, which correspondingly register themselves as "HIGH"
+  priority or "LOW" priority daemon at the lookup daemon. We use "chrt" command
+  to configure the scheduling priority of these two daemon processes.
+  * Before initiating a daemon, create a folder under the current directory,
+    with folder name the same as what parameter "data-path" specifies.
+  * Before initiating a daemon, change parameter "broadcast-address" to
+    your own host IP address
+  * Before initiating a daemon, change parameter "lookupd-tcp-address" to
+    your own lookup daemon address
+
+Run test step-by-step:
+* To run stress test with CPU contention (e.g., page 26 of WashU-Report-7-6):
+  * Run, e.g., " sh publisher_create.sh 100 " to create 10 non-latency-sensitive
+    publishers (each of them with 10 producers), and 1 latency-sensitive publisher.
+    * publisher_dump parameters include: number of producers; topic for
+      the first producer; repeat how many messages in a period (4 ms); lookup
+      daemon address; priority for topics from this publisher.
+    * publisher (mimic latency-sensitive application) parameters include:
+      number of producers; topic for the first producer; inter-msg gap;
+      lookup daemon address; priority of topics from this publisher.
+  * At the receiver host, run, e.g., " sh subscriber_create.sh 100 " to create
+    10 non-latency-sensitive subscribers (each of them with 10 consumers), and 1
+    latency-sensitive subscriber.
+    * subscriber_dump parameters include: number of consumers; topic for the
+      first consumer; number of sources for each topic; lookup daemon address.
+      * subscriber_dump records the throughput of receiving topics. This
+        feature can be enabled/disabled in program.
+      * In func NewNsq (nsqio/Test/subscriber_dump/mq/nsq.go), we set the
+        MaxInFlight and OutputBufferSize, which are two important parameters
+        (see WashU-Report-6-13 for more details).
+        * These two parameters should be carefully configured for any consumers.
+    * subscriber (mimic latency-sensitive application) parameters include:
+      number of consumers; topic for the first consumer; lookup daemon address.
+      * subscriber records latency results for every message it receives.
+      * If you are interested in the latency results of non-latency-sensitive
+        topics, replace publisher_dump & subscriber_dump with publisher & subscriber,
+        and correspondingly reset the related parameters and scheduling priority.
+
+* To run stress test with network congestion (e.g., page 28 of WashU-Report-7-6):
+  * Run publisher_create.sh and subscriber_create.sh based on the instructions above.
+    * Change the msg-size in the main function of publisher_dump (or publisher).
+  * Run qdisc.sh to configure the QDisc in Linux.
+    * Change the dport value to the actual port number associated with the
+      (latency-sensitive) subscriber.
+
+* To run functionality test of rate control
+  (e.g., page 7 of WashU-Report-9-26):
+  * Uncomment line 13 and line 14, and comment out other lines in
+    publisher_create.sh.
+    * publisher_func parameters include: number of producers; topic
+      for the first producer; repeat how many messages in a period (1 ms);
+      lookup daemon address; priority of topics from this publisher.
+  * Uncomment line 13 and line 14, and comment out other lines in
+    subscriber_create.sh.
+    * subscriber_func parameters include: number of consumers; topic for
+      the first consumer; number of sources for each topic; lookup daemon address
+
+* To evaluate latency improvement contributed by rate control
+  (e.g., page 10 of WashU-Report-9-26):
+  * Run publisher_create.sh and subscriber_create.sh based on
+    the instructions above.

@@ -1,0 +1,15 @@
+[nsqd] 2017/02/06 09:33:15.685089 nsqd v0.3.7 (built w/go1.6)
+[nsqd] 2017/02/06 09:33:15.685213 ID: 0
+[nsqd] 2017/02/06 09:33:15.685280 NSQ: persisting topic/channel metadata to ltmp/nsqd.0.dat
+[nsqd] 2017/02/06 09:33:15.686484 TCP: listening on [::]:5012
+[nsqd] 2017/02/06 09:33:15.686604 HTTP: listening on [::]:5013
+[nsqd] 2017/02/06 09:33:15.687366 LOOKUP(10.0.0.26:4160): adding peer
+[nsqd] 2017/02/06 09:33:15.687383 LOOKUP connecting to 10.0.0.26:4160
+[nsqd] 2017/02/06 09:33:15.690795 LOOKUPD(10.0.0.26:4160): peer info {TCPPort:4160 HTTPPort:4161 Version:0.3.7 BroadcastAddress:s1.localdomain}
+[nsqd] 2017/02/06 09:33:27.906437 NSQ: persisting topic/channel metadata to ltmp/nsqd.0.dat
+[nsqd] 2017/02/06 09:33:27.906472 TCP: closing [::]:5010
+[nsqd] 2017/02/06 09:33:27.906656 HTTP: closing [::]:5013
+[nsqd] 2017/02/06 09:33:27.908412 NSQ: closing topics
+[nsqd] 2017/02/06 09:33:27.908497 QUEUESCAN: closing
+[nsqd] 2017/02/06 09:33:27.908510 ID: closing
+[nsqd] 2017/02/06 09:33:27.908516 LOOKUP: closing

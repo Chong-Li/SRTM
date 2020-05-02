@@ -1,0 +1,11 @@
+Compile
+
+make
+
+Run TCP with default setting, 5000000 packets send in full speed, 10000 latency records.
+On Machine A $./tcpserver <port>
+On Machine B $./tcpclient <machine_A_IP> <port>
+
+Run UDP with default setting,
+On Machine A $./udpserver <port>
+On Machine B $./udpclient <machine_A_IP> <port>

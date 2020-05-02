@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head>
+    <title>nsqadmin</title>
+    <link rel="icon" type="image/png" href="/static/favicon.png">
+    <link rel="stylesheet" href="/static/bootstrap.min.css">
+    <link rel="stylesheet" href="/static/base.css">
+    <meta http-equiv="Content-type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <img class="image-preview img-polaroid">
+
+    <div id="container"></div>
+
+    <script type="text/javascript">
+        var USER_AGENT = 'nsqadmin/v0.3.7';
+        var VERSION = '0.3.7';
+        var GRAPHITE_URL = '';
+        var GRAPH_ENABLED = false;
+        var USE_STATSD_PREFIXES = true;
+        var STATSD_COUNTER_FORMAT = 'stats.counters.%s.count';
+        var STATSD_GAUGE_FORMAT = 'stats.gauges.%s';
+        var STATSD_INTERVAL =  60 ;
+        var STATSD_PREFIX = 'nsq.%s';
+        var NSQLOOKUPD = ['10.0.0.26:5013',];
+    </script>
+    <script src="/static/vendor.js"></script>
+    <script src="/static/main.js"></script>
+</body>
+</html>

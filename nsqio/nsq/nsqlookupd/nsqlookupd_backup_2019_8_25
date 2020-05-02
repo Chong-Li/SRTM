@@ -1,0 +1,515 @@
+package nsqlookupd
+
+import (
+	"fmt"
+	"io/ioutil"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"strconv"
+	"time"
+	"sort"
+
+	"github.com/WU-CPSL/RTM-0.1/nsqio/nsq/internal/http_api"
+	"github.com/WU-CPSL/RTM-0.1/nsqio/nsq/internal/protocol"
+	"github.com/WU-CPSL/RTM-0.1/nsqio/nsq/internal/util"
+	"github.com/WU-CPSL/RTM-0.1/nsqio/nsq/internal/version"
+	"github.com/WU-CPSL/RTM-0.1/nsqio/go-nsq"
+	
+)
+
+type NSQLookupd struct {
+	sync.RWMutex
+	opts         *Options
+	tcpListener  net.Listener
+	httpListener net.Listener
+	waitGroup    util.WaitGroupWrapper
+	DB           *RegistrationDB
+	Manager      *MTCAddrManager
+	ReportBack   map[*ClientV1]bool
+	profileTopic chan string
+}
+
+func New(opts *Options) *NSQLookupd {
+	if opts.MulticastFlag {
+		n := &NSQLookupd{
+			opts:       opts,
+			DB:         NewRegistrationDB(),
+			Manager:    NewMTCAddrManager(opts),
+			ReportBack: make(map[*ClientV1]bool),
+			profileTopic: make(chan string),
+		}
+		n.logf(version.String("nsqlookupd"))
+		return n
+	} else {
+		n := &NSQLookupd{
+			opts:       opts,
+			DB:         NewRegistrationDB(),
+			ReportBack: make(map[*ClientV1]bool),
+		}
+		n.logf(version.String("nsqlookupd"))
+		return n
+	}
+}
+
+func (l *NSQLookupd) logf(f string, args ...interface{}) {
+	if l.opts.Logger == nil {
+		return
+	}
+	l.opts.Logger.Output(2, fmt.Sprintf(f, args...))
+}
+
+func (l *NSQLookupd) Main() {
+	ctx := &Context{l}
+
+	//yao
+	l.grabHighPriorityTopics(l.opts.HighPriorityTopicFile)
+
+	tcpListener, err := net.Listen("tcp", l.opts.TCPAddress)
+	if err != nil {
+		l.logf("FATAL: listen (%s) failed - %s", l.opts.TCPAddress, err)
+		os.Exit(1)
+	}
+	l.Lock()
+	l.tcpListener = tcpListener
+	l.Unlock()
+	tcpServer := &tcpServer{ctx: ctx}
+	l.waitGroup.Wrap(func() {
+		protocol.TCPServer(tcpListener, tcpServer, l.opts.Logger)
+	})
+
+	httpListener, err := net.Listen("tcp", l.opts.HTTPAddress)
+	if err != nil {
+		l.logf("FATAL: listen (%s) failed - %s", l.opts.HTTPAddress, err)
+		os.Exit(1)
+	}
+	l.Lock()
+	l.httpListener = httpListener
+	l.Unlock()
+	httpServer := newHTTPServer(ctx)
+	l.waitGroup.Wrap(func() {
+		http_api.Serve(httpListener, httpServer, "HTTP", l.opts.Logger)
+	})
+	//RTM.dtb
+	l.DB.brokerList=make(map[string][]*Producer)
+	l.DB.profileTopic = make(chan int, 1)
+        l.DB.profileChan = make(chan int, 1)
+        l.DB.TBChan = make(chan int64, 1)
+	go l.dist()
+	//go l.dist2()
+}
+
+func (l *NSQLookupd) dist(){
+	var brokers []*Producer
+	//lCurve := [14]float64{0.0, 0.102, 0.114, 0.133, 0.153, 0.178, 0.198, 0.238, 0.271, 0.330, 0.454, 0.564, 0.824, 1.289}
+	
+	for {
+		time.Sleep(10*time.Second)
+		//brokers = l.DB.FindProducers("client", "", "").FilterByActive(
+                //l.opts.InactiveProducerTimeout, 0)
+		brokers = l.DB.brokerList[l.DB.TPName]
+		if len(brokers) >= 2 {
+			break
+		}
+	}
+	for {
+		fmt.Printf("%v brokers: waiting for pubNum\n",len(brokers))
+		<-l.DB.profileTopic
+		K:= 1
+		i:=0
+		rate := l.DB.TPRate
+		l.DB.keys = make([]int, len(l.DB.groups))
+        	kIndex := 0
+        	for k, _:= range l.DB.groups {
+                	l.DB.keys[kIndex]=k
+                	kIndex++
+        	}
+		sort.Slice(l.DB.keys, func(i, j int) bool {return l.DB.keys[i] < l.DB.keys[j]})
+		for _, b:= range brokers {
+			b.peerInfo.pubs = []int{}
+		}
+		for i=0; i< len(brokers); i++ {
+			rcap := 150000 - brokers[i].peerInfo.totalRate
+			rate_add := rcap
+			if rcap > rate {
+				rate_add = rate
+			}
+			fmt.Printf("~~~!!!!!!! rateadd %v, rcap=%v\n", rate_add, rcap)
+			pub_add := l.assemble(float64(rate_add)/float64(l.DB.TPRate), rate_add)
+			l.sendProfile(brokers[i], pub_add)
+			fmt.Printf("~~~~~~~~~~~~~!!!!!!!!!! Send profile %v %v\n", l.DB.TPName, len(pub_add))
+                	exceed := <- l.DB.profileChan
+			if exceed == 2 {
+				l.sendUnProfile(brokers[i], pub_add)
+				rate_assign:= l.fit(brokers[i], 0, rate_add)
+				fmt.Printf("fit %v to broker[%v]\n", rate_assign, i)
+				//ratio := float64(rate_assign)/float64(l.DB.TPRate)
+				brokers[i].peerInfo.groups = make(map[int]*CorGroup)
+				for _, key := range l.DB.keys {
+					g := l.DB.groups[key]
+					brokers[i].peerInfo.groups[key]=&CorGroup{
+                                		num: 0,
+                                		index: 0,
+                                		pubs: []int{},
+                                		assigns: []int{},
+                        		}
+                			j:= g.index
+                			//num:= int(float64(g.num)*ratio)
+                			for ; j<g.tmp_index; j++ {
+                        			l.DB.mmDist[g.pubs[j]]=brokers[i]
+						brokers[i].peerInfo.pubs = append(brokers[i].peerInfo.pubs, g.pubs[j])
+                				brokers[i].peerInfo.groups[key].num++
+						brokers[i].peerInfo.groups[key].pubs = append(brokers[i].peerInfo.groups[key].pubs, g.pubs[j])
+					}
+                			g.index = j
+        			}
+				rate -= rate_assign
+				if rate <= 0 {
+					break
+				}
+				fmt.Printf("~~~~~~~~~~~~~~!!!!!!!! Migrate from %v\n", i)
+				pub_add :=[]int{}
+				for _, key := range l.DB.keys {
+					g:=l.DB.groups[key]
+					j:= g.index
+					for ; j< g.num; j++ {
+						pub_add = append(pub_add, g.pubs[j])
+					}
+				}
+				l.sendMigrate(brokers[i], pub_add, []byte(brokers[i+1].peerInfo.BroadcastAddress+":"+strconv.Itoa(brokers[i+1].peerInfo.TCPPort)))
+				time.Sleep(30*time.Second)
+			} else {
+				brokers[i].peerInfo.groups = make(map[int]*CorGroup)
+                                for _, key := range l.DB.keys {
+					g:=l.DB.groups[key]
+                                        brokers[i].peerInfo.groups[key]=&CorGroup{
+                                                num: 0,
+                                                index: 0,
+                                                pubs: []int{},
+                                                assigns: []int{},
+                                        }
+                                        j:= g.index
+                                        for ; j<g.num; j++ {
+                                                l.DB.mmDist[g.pubs[j]]=brokers[i]
+                                                brokers[i].peerInfo.pubs = append(brokers[i].peerInfo.pubs, g.pubs[j])
+                                                brokers[i].peerInfo.groups[key].num++
+                                                brokers[i].peerInfo.groups[key].pubs = append(brokers[i].peerInfo.groups[key].pubs, g.pubs[j])
+                                        }
+                                        g.index = j
+                                }
+				break
+			}
+		}
+		K = i+1
+		fmt.Printf("~~~~~~~~~~~~~~~~~!!!!!!!!!!!!!!! after bin-packing: K=%v\n", K)	
+		for i:=0; i<K; i++ {
+                        brokers[i].peerInfo.tpRate = 0
+                        for _, p:= range brokers[i].peerInfo.pubs {
+                                brokers[i].peerInfo.tpRate += l.DB.rates[p]
+                        }
+			fmt.Println(brokers[i].peerInfo.tpRate)
+			brokers[i].peerInfo.keys = make([]int, len(brokers[i].peerInfo.groups))
+	                kIndex = 0
+			for k, _:= range brokers[i].peerInfo.groups {
+                        	brokers[i].peerInfo.keys[kIndex]=k
+                        	kIndex++
+                	}
+			sort.Slice(brokers[i].peerInfo.keys, func(x, y int) bool {return brokers[i].peerInfo.keys[x] < brokers[i].peerInfo.keys[y]})
+                }
+
+		avg := l.DB.TPRate/K
+		lastBroker := brokers[K-1]
+		for i:=0; i<K-1; i++ {
+			ex := brokers[i].peerInfo.tpRate - avg
+			info := []byte(lastBroker.peerInfo.BroadcastAddress+":"+strconv.Itoa(lastBroker.peerInfo.TCPPort))
+                        pub_add := l.assembleMM(float64(ex)/float64(brokers[i].peerInfo.tpRate), ex, brokers[i])
+			fmt.Printf("~~~~~~~~~~~~~!!!!!!!!!! migrate %v %v to the lastbroker\n", l.DB.TPName, len(pub_add))
+			l.sendMigrate(brokers[i], pub_add, info)
+			time.Sleep(30*time.Second)
+
+			pub_add = append(pub_add, lastBroker.peerInfo.pubs...)
+			fmt.Printf("~~~~~~~~~~~~~!!!!!!!!!! %v %v to the lastbroker\n", l.DB.TPName, len(pub_add))
+                        l.sendProfile(lastBroker, pub_add)
+			for _, g:= range brokers[i].peerInfo.groups {
+				g.tmp_index2 = g.tmp_index
+			}
+			exceed:= <- l.DB.profileChan
+			if exceed == 2 {
+				l.sendUnProfile(lastBroker, pub_add)
+                                l.fitMM(lastBroker,0,ex, brokers[i])
+				pub_back := []int{}
+				for _, g := range brokers[i].peerInfo.groups {
+					for x:=0; x<g.tmp_index; x++ {
+						l.DB.mmDist[g.pubs[x]]=lastBroker
+						lastBroker.peerInfo.pubs = append(lastBroker.peerInfo.pubs, g.pubs[x])
+					}
+					for x:= g.tmp_index; x<g.tmp_index2; x++ {
+						pub_back = append(pub_back, g.pubs[x])
+					}
+					g.pubs = g.pubs[g.tmp_index:]
+				}
+				l.sendMigrate(lastBroker, pub_back, []byte(brokers[i].peerInfo.BroadcastAddress+":"+strconv.Itoa(brokers[i].peerInfo.TCPPort)))
+				brokers[i].peerInfo.pubs = []int{}
+				for _, g:= range brokers[i].peerInfo.groups {
+					brokers[i].peerInfo.pubs = append(brokers[i].peerInfo.pubs, g.pubs...)
+				}
+				break
+			} else {
+				for _, g := range brokers[i].peerInfo.groups {
+                                        for x:=0; x<g.tmp_index; x++ {
+                                                l.DB.mmDist[g.pubs[x]]=lastBroker
+                                                lastBroker.peerInfo.pubs = append(lastBroker.peerInfo.pubs, g.pubs[x])
+                                        }
+                                        g.pubs = g.pubs[g.tmp_index:]
+                                }
+                                brokers[i].peerInfo.pubs = []int{}
+                                for _, g:= range brokers[i].peerInfo.groups {
+                                        brokers[i].peerInfo.pubs = append(brokers[i].peerInfo.pubs, g.pubs...)                            
+                                }
+				continue
+			}
+
+		}
+		for i:=0; i<K; i++ {
+                        brokers[i].peerInfo.tpRate = 0
+                        for _, p:= range brokers[i].peerInfo.pubs {
+                                brokers[i].peerInfo.tpRate += l.DB.rates[p]
+                        }
+                        fmt.Println(brokers[i].peerInfo.tpRate)
+                }
+	}
+}
+
+func (l *NSQLookupd) assemble(ratio float64, rate int) []int {
+	if ratio > 1.0 {
+		ratio = 1.0
+	}
+	pubs := []int{}
+	rate_add := 0
+	index := 0
+	for _, key := range l.DB.keys {
+		g := l.DB.groups[key]
+		i:= g.index
+		num:= int(float64(g.num)*ratio)
+		for ; i<g.num && i< (g.index+num); i++ {
+			pubs = append(pubs, g.pubs[i])
+			rate_add += l.DB.rates[g.pubs[i]]
+		}
+		g.tmp_index = i
+	}
+	if rate_add < int(0.8*float64(rate)) {
+		index = 0
+		for rate_add < rate {
+			g := l.DB.groups[l.DB.keys[index]]
+			if g.tmp_index < g.num {
+				pubs = append(pubs, g.pubs[g.tmp_index])
+				rate_add += l.DB.rates[g.pubs[g.tmp_index]]
+				g.tmp_index++
+			}
+			index = (index+1)%len(l.DB.groups)
+		}
+	}
+	return pubs
+}
+
+func (l *NSQLookupd) assembleMM(ratio float64, rate int, broker *Producer) []int {
+        if ratio > 1.0 {
+                ratio = 1.0
+        }
+        pubs := []int{}
+        rate_add := 0
+        for _, key := range broker.peerInfo.keys {
+		g:= broker.peerInfo.groups[key]
+                i:= g.index
+                num:= int(float64(g.num)*ratio)
+                for ; i<g.num && i< (g.index+num); i++ {
+                        pubs = append(pubs, g.pubs[i])
+                        rate_add += l.DB.rates[g.pubs[i]]
+                }
+                g.tmp_index = i
+        }
+        if rate_add < int(0.8*float64(rate)) {
+                index := 0
+                for rate_add < rate {
+                        g := broker.peerInfo.groups[broker.peerInfo.keys[index]]
+                        if g.tmp_index < g.num {
+                                pubs = append(pubs, g.pubs[g.tmp_index])
+                                rate_add += l.DB.rates[g.pubs[g.tmp_index]]
+                                g.tmp_index++
+                        }
+                        index = (index+1)%len(broker.peerInfo.keys)
+                }
+        }
+        return pubs
+}
+
+func (l *NSQLookupd) fit(broker *Producer, left int, right int) int {
+	fmt.Printf("Fit [%v %v]\n", left, right)
+	if left == right {
+		pub_add := l.assemble(float64(left)/float64(l.DB.TPRate), left)
+		l.sendProfile(broker, pub_add)
+		exceed := <- l.DB.profileChan
+		if exceed == 2 {
+			l.sendUnProfile(broker, pub_add)
+			return -1
+		} else {
+			return left
+		}
+	}
+	mid:= left + (right-left)/2
+	pub_add := l.assemble(float64(mid)/float64(l.DB.TPRate), mid)
+	l.sendProfile(broker, pub_add)
+	exceed:= <- l.DB.profileChan
+	if exceed == 2 {
+		l.sendUnProfile(broker, pub_add)
+		return l.fit(broker, left, mid)
+	} else if exceed == 0 {
+		index := l.fit(broker, mid+1, right)
+		if index == -1 {
+			return mid
+		} else {
+			return index
+		}
+	} else {
+		return mid
+	}
+}
+
+func (l *NSQLookupd) fitMM(broker *Producer, left int, right int, srcBroker *Producer) int {
+        fmt.Printf("Fit [%v %v]\n", left, right)
+        if left == right {
+                pub_add := l.assembleMM(float64(left)/float64(srcBroker.peerInfo.tpRate), left, srcBroker)
+                pub_add = append(pub_add, broker.peerInfo.pubs...)
+		l.sendProfile(broker, pub_add)
+                exceed := <- l.DB.profileChan
+                if exceed == 2 {
+                        l.sendUnProfile(broker, pub_add)
+                        return -1
+                } else {
+                        return left
+                }
+        }
+        mid:= left + (right-left)/2
+        pub_add := l.assembleMM(float64(mid)/float64(srcBroker.peerInfo.tpRate), mid, srcBroker)
+        pub_add = append(pub_add, broker.peerInfo.pubs...)
+	l.sendProfile(broker, pub_add)
+        exceed:= <- l.DB.profileChan
+        if exceed == 2 {
+                l.sendUnProfile(broker, pub_add)
+                return l.fitMM(broker, left, mid, srcBroker)
+        } else if exceed == 0 {
+                index := l.fitMM(broker, mid+1, right, srcBroker)
+                if index == -1 {
+                        return mid
+                } else {
+                        return index
+                }
+        } else {
+                return mid
+        }
+}
+
+func (l *NSQLookupd) sendProfile(broker *Producer, pub_add []int) {
+                pubs := [][]byte{}
+                pubs=append(pubs, []byte(l.DB.TPName))
+                pubs=append(pubs,[]byte(strconv.Itoa(len(pub_add))))
+                cmd:= nsq.Profile(pubs)
+                cmd.WriteTo(broker.peerInfo.backup.client)
+                x:=0
+                for {
+                          params := [][]byte{}
+                          for y:=0; y<1000 && x<len(pub_add); y++ {
+                                        params=append(params, []byte(strconv.Itoa(pub_add[x])))
+                                        x++
+                          }
+                          cmd:= nsq.Profile(params)
+                          cmd.WriteTo(broker.peerInfo.backup.client)
+                          if x >= len(pub_add) {
+                                        break
+                          }
+                }
+}
+func (l *NSQLookupd) sendUnProfile(broker *Producer, pub_add []int) {
+                pubs := [][]byte{}
+                pubs=append(pubs, []byte(l.DB.TPName))
+                pubs=append(pubs,[]byte(strconv.Itoa(len(pub_add))))
+                cmd:= nsq.UnProfile(pubs)
+                cmd.WriteTo(broker.peerInfo.backup.client)
+                x:=0
+                for {
+                          params := [][]byte{}
+                          for y:=0; y<1000 && x<len(pub_add); y++ {
+                                        params=append(params, []byte(strconv.Itoa(pub_add[x])))
+                                        x++
+                          }
+                          cmd:= nsq.UnProfile(params)
+                          cmd.WriteTo(broker.peerInfo.backup.client)
+                          if x >= len(pub_add) {
+                                        break
+                          }
+                }
+}
+func (l *NSQLookupd) sendMigrate(broker *Producer, pub_add []int, info []byte) {
+                pubs := [][]byte{}
+                pubs=append(pubs, []byte(l.DB.TPName))
+		pubs=append(pubs, info)
+                pubs=append(pubs,[]byte(strconv.Itoa(len(pub_add))))
+                cmd:= nsq.Migrate(pubs)
+                cmd.WriteTo(broker.peerInfo.backup.client)
+                x:=0
+                for {
+                          params := [][]byte{}
+                          for y:=0; y<1000 && x<len(pub_add); y++ {
+                                        params=append(params, []byte(strconv.Itoa(pub_add[x])))
+                                        x++
+                          }
+                          cmd:= nsq.Migrate(params)
+                          cmd.WriteTo(broker.peerInfo.backup.client)
+                          if x >= len(pub_add) {
+                                        break
+                          }
+                }
+}
+
+//YAO
+//Initilize the high_priority topic list
+func (l *NSQLookupd) grabHighPriorityTopics(fileName string) {
+
+	content, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		println("YAO:READ ERROR")
+	}
+	lines := strings.Split(string(content), "\n")
+
+	for _, line := range lines {
+		temp := strings.Split(line, " ")
+		topicName := temp[0]
+		key := Registration{"high_priority_topic", topicName, ""}
+		l.DB.AddRegistration(key)
+	}
+
+}
+
+func (l *NSQLookupd) RealTCPAddr() *net.TCPAddr {
+	l.RLock()
+	defer l.RUnlock()
+	return l.tcpListener.Addr().(*net.TCPAddr)
+}
+
+func (l *NSQLookupd) RealHTTPAddr() *net.TCPAddr {
+	l.RLock()
+	defer l.RUnlock()
+	return l.httpListener.Addr().(*net.TCPAddr)
+}
+
+func (l *NSQLookupd) Exit() {
+	if l.tcpListener != nil {
+		l.tcpListener.Close()
+	}
+
+	if l.httpListener != nil {
+		l.httpListener.Close()
+	}
+	l.waitGroup.Wait()
+}

@@ -1,0 +1,6 @@
+Compile the code with command
+./test_cons.py -b or ./test_prod.py -b
+
+Run the scripts in two machine
+On machine A: $./test_prod.py
+On machine B: $./test_cons.py -a <machine A IP>

@@ -1,0 +1,7 @@
+Compile the code with command
+./make.py
+
+Run Multicast with default setting, 5000000 packets send in full speed, 10000 latency records, with multicast address 224.0.0.1
+Run the scripts in two machine, the network should have multicast enabled, with both PIM and ICMP enabled.
+On machine A: $./client
+On machine B: $./server

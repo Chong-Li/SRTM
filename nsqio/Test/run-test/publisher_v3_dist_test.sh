@@ -1,0 +1,13 @@
+#!/bin/bash
+i=1
+while [ "$i" -le "$1" ]; do
+	taskset -c 0-8,11-39 ../bin/publisher_dump_v3 1 "$i" 1 127.0.0.1:4161 HIGH &
+	#taskset -c 0-8,11-39 $GOPATH/bin/publisher_v3 1 "$i" 2048 127.0.0.1:4161 HIGH &
+	chrt -r -p 95 $!
+	sleep 1
+	i=$(($i+1))
+done
+
+
+taskset -c 0-8,11-39 $GOPATH/bin/publisher_v3 1 0 2048 127.0.0.1:4161 HIGH &
+chrt -r -p 95 $!

@@ -1,0 +1,966 @@
+// +build rtm
+
+package nsqd
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
+	//"io/ioutil"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	//"runtime"
+	//"syscall"
+	//"unsafe"
+	//"sort"
+
+	"github.com/WU-CPSL/RTM-0.1/nsqio/nsq/internal/quantile"
+	"github.com/WU-CPSL/RTM-0.1/nsqio/nsq/internal/util"
+	"github.com/WU-CPSL/RTM-0.1/nsqio/nsq/transport"
+	"github.com/WU-CPSL/RTM-0.1/nsqio/rate"
+	//"github.com/gonum/stat"
+)
+/*
+#define _GNU_SOURCE
+#include <sched.h>
+#include <pthread.h>
+
+void lock_thread(int cpuid) {
+        pthread_t tid;
+        cpu_set_t cpuset;
+
+        tid = pthread_self();
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpuid, &cpuset);
+    pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+}
+*/
+import "C"
+
+
+type Topic struct {
+	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	messageCount uint64
+
+	sync.RWMutex
+
+	name              string
+	channelMap        map[string]*Channel
+	backend           BackendQueue
+	memoryMsgChan     chan *Message
+	exitChan          chan int
+	channelUpdateChan chan int
+	waitGroup         util.WaitGroupWrapper
+	exitFlag          int32
+
+	ephemeral      bool
+	deleteCallback func(*Topic)
+	deleter        sync.Once
+
+	paused    int32
+	pauseChan chan bool
+
+	ctx *context
+	//RTM
+	memMsgChan  chan *Message
+	bucket      *rate.Limiter
+	bucketSize  int
+	bucketRate  float64
+	quantum     int
+	pullChan    chan int
+	limiterChan chan int
+	talb        bool
+	profile     bool
+	Lats        []byte
+	Last        int64
+
+	pubclients     map[int]*clientV2
+	clients        map[int64]*clientV2
+	subClients     map[int64]*clientV2
+	clientLock     sync.RWMutex
+	index          int
+	congestion     bool
+	congest        bool
+	congestLock    sync.RWMutex
+	lastMsgCount   uint64
+	lastMsgCount2  uint64
+	lastMsgCount3  uint64
+	lastRateUpload int
+	curK           int
+	lastRateMax    int
+	lastQMax       int
+	rateWind       []int
+	qWind          []int
+	msgsLen        int64
+	startRec       bool
+	startTime      int64
+	profileReset   bool
+	pubClients     map[int]*clientV2
+	allPubClients  map[int]*clientV2
+	Tmpq           []*Message
+	Tmpindex       int
+	inDC   bool
+
+	// multicast
+	MTCAddr *net.UDPAddr
+}
+
+// Topic constructor
+func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topic {
+	t := &Topic{
+		name:       topicName,
+		channelMap: make(map[string]*Channel),
+		memoryMsgChan:     make(chan *Message, 1),
+		rateWind:          make([]int, 1000),
+		qWind:             make([]int, 1000),
+		Lats:              []byte{},
+		Last:              0,
+		curK:              0,
+		inDC:              false,
+		exitChan:          make(chan int),
+		channelUpdateChan: make(chan int),
+		ctx:               ctx,
+		pauseChan:         make(chan bool),
+		deleteCallback:    deleteCallback,
+	}
+
+	// RTM:
+	// Configure the rate limiter for this topic.
+	// First parameter is the average rate, second parameter
+	// is the burst that we can handle.
+
+	t.memMsgChan = make(chan *Message, ctx.nsqd.getOpts().MemQueueSize)
+	/*if strings.HasPrefix(topicName, "0")||strings.HasPrefix(topicName,"x") {
+		results, _ := ioutil.ReadFile("/home/RTM/run-test-backup/TB")
+                r := 100
+                b := 100
+		x:=strings.Split(topicName[1:], "b")
+                index, _:= strconv.Atoi(x[0])
+                for i, value := range bytes.Split(results[0:], []byte{'\n'}){
+                        if i == index {
+                                paras := strings.Fields(string(value))
+                                r, _ = strconv.Atoi(paras[0])
+                                b, _ = strconv.Atoi(paras[1])
+                                break
+                        }
+                        continue
+                }
+                t.bucket = rate.NewLimiter(rate.Limit(r), b)//RTM.dtb
+                t.bucketRate = float64(r)
+                t.bucketSize = b
+
+	} else if strings.HasPrefix(topicName, "p") {
+                t.bucket = rate.NewLimiter(22000000, 3000000)//RTM.dtb
+                t.bucketRate = float64(22000000)
+                t.bucketSize = 3000000
+	} else {
+		//RTM.dtb
+		fmt.Printf("~~~~~~~~~~~%v\n", topicName)
+		t.bucket = rate.NewLimiter(88000, 100)
+		t.bucketRate = float64(88000)
+		t.bucketSize = 100
+	}*/
+	if strings.HasPrefix(topicName, "tb") {
+		go func(){
+			time.Sleep(30*time.Second)
+			for _, p:= range t.allPubClients {
+				p.arrTimes = make([]time.Time, p.sNum)
+				p.profile = true
+			}
+			time.Sleep(70*time.Second)
+			for _,p:= range t.allPubClients {
+				p.profile = false
+			}
+			fmt.Printf("~~~~~~~~~~~~~~~~~~~~~~wait for 90\n")
+			t.ctx.nsqd.topicChan <- t
+		}()
+	}
+	/*if t.bucketSize/6 > 10 {
+		t.quantum = 10
+	} else {
+		t.quantum = t.bucketSize/6
+	}*/
+	t.quantum = 1
+	t.pullChan = make(chan int, 1)
+	t.limiterChan = make(chan int, 1)
+	t.index = 0
+	t.congestion = false
+	t.congest = false
+	t.pubClients=make(map[int]*clientV2)
+	t.allPubClients=make(map[int]*clientV2)
+	t.clients = make(map[int64]*clientV2)
+	t.subClients = make(map[int64]*clientV2)
+	t.talb = false
+	t.startRec = false
+	t.profileReset = false
+
+	if strings.HasSuffix(topicName, "#ephemeral") {
+		t.ephemeral = true
+		t.backend = newDummyBackendQueue()
+	} else {
+		t.backend = newDiskQueue(topicName,
+			ctx.nsqd.getOpts().DataPath,
+			ctx.nsqd.getOpts().MaxBytesPerFile,
+			int32(minValidMsgLength),
+			int32(ctx.nsqd.getOpts().MaxMsgSize)+minValidMsgLength,
+			ctx.nsqd.getOpts().SyncEvery,
+			ctx.nsqd.getOpts().SyncTimeout,
+			ctx.nsqd.getOpts().Logger)
+	}
+
+	//t.waitGroup.Wrap(func() { t.messagePump() })
+	go t.msgPump()
+	//RTM.dtb
+	/*x:=strings.Split(topicName[1:], "b")
+        index, _:= strconv.Atoi(x[0])
+	if index == 100 {
+	startTime := time.Now().UnixNano()
+	go func(){
+		time.Sleep(30*time.Second)
+		for _, tp:= range ctx.nsqd.topicMap {
+			tp.Lock()
+			tp.startRec = true
+			tp.Unlock()
+		}
+		startTime = time.Now().UnixNano()
+	}()
+	go func(){
+		time.Sleep(60*time.Second)
+		for _, tp:= range ctx.nsqd.topicMap {
+			tp.Lock()
+			tp.startRec = false
+			tp.Unlock()
+		}
+		finishTime := time.Now().UnixNano()
+		fmt.Printf("~~~~~~ local profile finish at %v\n", finishTime)
+		time.Sleep(30*time.Second)
+		interval := float64((finishTime - startTime))
+		departNums := int64(0)
+		times := []int64{}
+		for _, tp := range ctx.nsqd.topicMap { 
+		for cID, c:= range tp.subClients {
+			departNums += c.departNums
+			fmt.Printf("%v: departNums=%v\n", cID, c.departNums)
+			times = append(times, c.departTimes[:c.departNums]...)
+		}
+		}
+		fmt.Printf("%v msgs in %v: rate= %v\n", departNums, interval, float64(departNums)/interval)
+		sort.Slice(times, func(i,j int) bool {return times[i]<times[j]})
+                dTimes := make([]float64, len(times)-1)
+                for i:= 1; i<len(times); i++ {
+                        dTimes[i-1]=float64(times[i]-times[i-1])
+                }
+                m, v := stat.MeanVariance(dTimes, nil)
+		s:= stat.Skew(dTimes, nil)
+		k:= stat.ExKurtosis(dTimes, nil)
+		fmt.Printf("%v departure msgs: m=%v, var=%v, s=%v, k=%v\n", len(dTimes), m, v, s, k)
+
+		times = []int64{}
+		totalNum := 0
+		for _, c:= range t.clients {
+			times = append(times, c.arrTimes[:c.arrNums]...)
+			totalNum+=c.arrNums
+			//fmt.Printf("%v: arrLen=%v\n", cID, c.arrNums)
+		}
+		fmt.Printf("msg num=%v, rate=%v\n", totalNum, float64(totalNum)/interval)
+		sort.Slice(times, func(i,j int) bool {return times[i]<times[j]})
+		aTimes := make([]float64, len(times)-1)
+		for i:= 1; i<len(times); i++ {
+			aTimes[i-1]=float64(times[i]-times[i-1])
+		}
+		m, v = stat.MeanVariance(aTimes, nil)
+                s= stat.Skew(aTimes, nil)
+                k= stat.ExKurtosis(aTimes, nil)
+                fmt.Printf("%v arrival msgs: m=%v, var=%v, s=%v, k=%v\n", len(aTimes), m, v, s, k)
+		mu := float64(4481)
+		threshold := float64(500000)
+		over := 0
+		pTimes := make([]float64, len(aTimes))
+		pTimes[0] = mu
+		for i:=1; i<len(pTimes); i++{
+			pTimes[i]=(pTimes[i-1]-aTimes[i-1])
+			if pTimes[i] < float64(0) {
+				pTimes[i]=float64(0)
+			}
+			pTimes[i]+=mu
+			if pTimes[i] > threshold {
+				over++
+			}
+		}
+		fmt.Printf("estimation = %v %v\n", over, float64(over)/float64(len(pTimes)))
+		sort.Float64s(aTimes)
+		fmt.Printf("%v %v %v %v\n", stat.Mean(aTimes, nil), aTimes[len(aTimes)/2], aTimes[len(aTimes)-100], aTimes[len(aTimes)-20])
+	}()
+	}*/
+	fmt.Printf("~~~~~~~~~notify %v\n", t.name)
+	t.ctx.nsqd.Notify(t)
+
+	return t
+}
+
+
+// Exiting returns a boolean indicating if this topic is closed/exiting
+func (t *Topic) Exiting() bool {
+	return atomic.LoadInt32(&t.exitFlag) == 1
+}
+
+func (t *Topic) GetDefaultChannel() {
+	t.Lock()
+	channel, isNew := t.getOrCreateChannel("multicast")
+	t.Unlock()
+	n := t.ctx.nsqd
+	if isNew {
+		t.RLock()
+		prot := &protocolV2{ctx: &context{nsqd: n}}
+		addrString := transport.GetIPAddr(n.getOpts().Interface) + ":" + strconv.Itoa(t.MTCAddr.Port)
+		srcAddr, err := net.ResolveUDPAddr("udp", addrString)
+		if err != nil {
+			n.logf("ERROR: failed to resolve address %s for interface %s - %s", addrString, n.getOpts().Interface, err)
+		}
+		mtcConn, err := transport.NewMTCConn(n.getOpts().Interface, srcAddr, t.MTCAddr, transport.MTCTypeWriteOnly)
+		n.logf("Channel(%s): creat connection from %s to %s", channel.name, srcAddr.String(), t.MTCAddr.String())
+		t.RUnlock()
+		if err != nil {
+			n.logf("ERROR: failed to create multicast socket to address %s interface %s - %s", t.MTCAddr.String(), n.getOpts().Interface, err)
+		} else {
+			go prot.IOLoopV2(mtcConn, ConnTypeMulticast, channel)
+		}
+		select {
+		case t.channelUpdateChan <- 1:
+		case <-t.exitChan:
+		}
+	}
+	n.logf("Channel(%s): created as default multicast channel for Topic (%s)", channel.name, channel.topicName)
+}
+
+// GetChannel performs a thread safe operation
+// to return a pointer to a Channel object (potentially new)
+// for the given Topic
+func (t *Topic) GetChannel(channelName string) *Channel {
+	t.Lock()
+	channel, isNew := t.getOrCreateChannel(channelName)
+	t.Unlock()
+
+	if isNew {
+		// update messagePump state
+		select {
+		case t.channelUpdateChan <- 1:
+		case <-t.exitChan:
+		}
+	}
+
+	return channel
+}
+
+// this expects the caller to handle locking
+func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
+	channel, ok := t.channelMap[channelName]
+	if !ok {
+		deleteCallback := func(c *Channel) {
+			t.DeleteExistingChannel(c.name)
+		}
+		channel = NewChannel(t.name, channelName, t.ctx, deleteCallback)
+		t.channelMap[channelName] = channel
+		t.ctx.nsqd.logf("TOPIC(%s): new channel(%s)", t.name, channel.name)
+		return channel, true
+	}
+	return channel, false
+}
+
+func (t *Topic) GetExistingChannel(channelName string) (*Channel, error) {
+	t.RLock()
+	defer t.RUnlock()
+	channel, ok := t.channelMap[channelName]
+	if !ok {
+		return nil, errors.New("channel does not exist")
+	}
+	return channel, nil
+}
+
+// DeleteExistingChannel removes a channel from the topic only if it exists
+func (t *Topic) DeleteExistingChannel(channelName string) error {
+	t.Lock()
+	channel, ok := t.channelMap[channelName]
+	if !ok {
+		t.Unlock()
+		return errors.New("channel does not exist")
+	}
+	delete(t.channelMap, channelName)
+	// not defered so that we can continue while the channel async closes
+	numChannels := len(t.channelMap)
+	t.Unlock()
+
+	t.ctx.nsqd.logf("TOPIC(%s): deleting channel %s", t.name, channel.name)
+
+	// delete empties the channel before closing
+	// (so that we dont leave any messages around)
+	channel.Delete()
+
+	// update messagePump state
+	select {
+	case t.channelUpdateChan <- 1:
+	case <-t.exitChan:
+	}
+
+	//RTM.dtb: plz don't delete topic. Original: if numChannels == 0
+	if numChannels == 0 && t.ephemeral == true {
+		go t.deleter.Do(func() { t.deleteCallback(t) })
+	}
+
+	return nil
+}
+
+// PutMessage writes a Message to the queue
+func (t *Topic) PutMessage(m *Message) error {
+
+	t.RLock()
+	defer t.RUnlock()
+	if atomic.LoadInt32(&t.exitFlag) == 1 {
+		return errors.New("exiting")
+	}
+	err := t.put(m)
+	if err != nil {
+		return err
+	}
+	atomic.AddUint64(&t.messageCount, 1)
+	return nil
+}
+
+// PutMessages writes multiple Messages to the queue
+func (t *Topic) PutMessages(msgs []*Message) error {
+	t.RLock()
+	defer t.RUnlock()
+	if atomic.LoadInt32(&t.exitFlag) == 1 {
+		return errors.New("exiting")
+	}
+	for _, m := range msgs {
+		err := t.put(m)
+		if err != nil {
+			return err
+		}
+	}
+	atomic.AddUint64(&t.messageCount, uint64(len(msgs)))
+	return nil
+}
+
+func (t *Topic) put(m *Message) error {
+	select {
+	case t.memoryMsgChan <- m:
+	default:
+		b := bufferPoolGet()
+		err := writeMessageToBackend(b, m, t.backend)
+		bufferPoolPut(b)
+		t.ctx.nsqd.SetHealth(err)
+		if err != nil {
+			t.ctx.nsqd.logf(
+				"TOPIC(%s) ERROR: failed to write message to backend - %s",
+				t.name, err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *Topic) Depth() int64 {
+	return int64(len(t.memoryMsgChan)) + t.backend.Depth()
+}
+
+// messagePump selects over the in-memory and backend queue and
+// writes messages to every channel for this topic
+func (t *Topic) msgPump() {
+
+	//RTM.dtb test, dedicate thread
+	//defer runtime.UnlockOSThread()
+	//var mask [1024/64]uint64
+	//mask[uint(11)/64] |= 1 << (uint(11)%64)
+	//mask[0]=1
+	//_,_,_=syscall.RawSyscall(203, uintptr(0), uintptr(len(mask)*8), uintptr(unsafe.Pointer(&mask)))
+	//runtime.LockOSThread()
+	//C.lock_thread(C.int(11))
+	//fmt.Printf("~~~~~~~~~~~!!!!!!!! Topic G at %v CPU core\n", C.sched_getcpu())
+	var msg *Message
+	var buf []byte
+	var err error
+	var chans []*Channel
+	var memoryMsgChan chan *Message
+	var backendChan chan []byte
+	//RTM
+	//var pullChan chan int
+	//var limiterChan chan int
+	chanIndex := 0
+	var reserve int
+	reserve = 0
+	var delay time.Duration
+	/*var x1 time.Time
+	x1Flag := false
+	x1List := []float64{}
+	go func() {
+		time.Sleep(90*time.Second)
+		m, v:= stat.MeanVariance(x1List, nil)
+		fmt.Printf("!!!!!!!!~~~~~~~ %v %v %v\n", len(x1List), m, v)
+		sort.Float64s(x1List)
+		l:=float64(len(x1List))
+		fmt.Printf("!!!!!!!!~~~~~~~~~~%v %v %v\n", x1List[int(l*0.5)], x1List[int(l*0.95)], x1List[int(l*0.99)])
+	}()*/
+
+	t.RLock()
+	for _, c := range t.channelMap {
+		chans = append(chans, c)
+	}
+	t.RUnlock()
+
+	if len(chans) > 0 {
+		memoryMsgChan = t.memoryMsgChan
+		backendChan = t.backend.ReadChan()
+		//RTM
+		//pullChan = t.pullChan
+		//limiterChan = t.limiterChan
+	}
+
+	//RTM, for dtb test only
+	//pullChan = t.pullChan
+	//limiterChan = t.limiterChan
+
+	for {
+		select {
+		case msg = <-memoryMsgChan:
+		case buf = <-backendChan:
+			msg, err = decodeMessage(buf)
+			if err != nil {
+				t.ctx.nsqd.logf("ERROR: failed to decode message - %s", err)
+				continue
+			}
+		case <-t.channelUpdateChan:
+			chans = chans[:0]
+			t.RLock()
+			for _, c := range t.channelMap {
+				chans = append(chans, c)
+			}
+			t.RUnlock()
+			if len(chans) == 0 || t.IsPaused() {
+				memoryMsgChan = nil
+				backendChan = nil
+				//RTM
+				//pullChan = nil
+				//limiterChan = nil
+			} else {
+				memoryMsgChan = t.memoryMsgChan
+				backendChan = t.backend.ReadChan()
+				//RTM
+				//pullChan = t.pullChan
+				//limiterChan = t.limiterChan
+			}
+			continue
+		case pause := <-t.pauseChan:
+			if pause || len(chans) == 0 {
+				memoryMsgChan = nil
+				backendChan = nil
+				//RTM
+				//pullChan = nil
+				//limiterChan = nil
+			} else {
+				memoryMsgChan = t.memoryMsgChan
+				backendChan = t.backend.ReadChan()
+				//RTM
+				//pullChan = t.pullChan
+				//limiterChan = t.limiterChan
+			}
+			continue
+		case <-t.exitChan:
+			goto exit
+
+		// RTM:
+		// Topic is still in congestion mode. There are still msgs
+		// that have already reserved tokens.
+		case <-t.limiterChan:
+		if reserve < t.Tmpindex {
+				// RTM:
+				// If the current dequeue operation makes the queue length below low-watermark (the current
+				// configuration is 0.3*capacity of the queue), wake up the messagePump in Client, which will
+				// send a decongestion signal back to producer.
+				/*if x1Flag {
+					d1 := time.Now().Sub(x1).Nanoseconds()
+					x1Flag = false
+					x1List = append(x1List, float64(d1))
+				}*/
+
+				msg = t.Tmpq[reserve]
+				//RTM.dtb test only
+				if bytes.HasPrefix(msg.Body[24:], []byte{'0'}) {
+					binary.PutVarint(msg.Body[60:], time.Now().UnixNano())
+					/*then1, _:=binary.Varint(msg.Body[40:58])
+                                        strx := []byte(strconv.Itoa(int(time.Now().UnixNano()-then1)))
+                                        strx = append(strx, "\n"...)
+                                        strx = append(strx, []byte(strconv.Itoa(int(then1-msg.Ktimestamp.UnixNano())))...)
+                                        strx = append(strx, "\n"...)
+                                        copy(msg.Body[60:], strx)*/
+
+				}
+				if t.congest &&
+					len(t.memMsgChan) < int(float64(cap(t.memMsgChan))*0.3) {
+					//copy(msg.Body[50:], []byte("decongest_sent"))
+					//binary.PutVarint(msg.Body[70:], time.Now().UnixNano())
+					t.congest = false
+					fmt.Printf("~~~~~~~~!!!!! Decongest\n")
+					t.clientLock.RLock()
+					for _, v := range t.clients {
+						select {
+						case v.DeCongestChan <- t.name:
+						default:
+						}
+					}
+					t.clientLock.RUnlock()
+				}
+				reserve++
+				goto send
+			}
+			continue
+		// RTM:
+		// Topic is not in congestion mode.
+		// It is wake up because there is pending msg.
+		case <-t.pullChan:
+		if t.congestion {
+				continue
+			}
+			if len(t.memMsgChan) > 0 {
+				// RTM:
+				// Try to reserve one token from the bucket
+				msg = <- t.memMsgChan
+				r1 := t.bucket.ReserveN(msg.Ktimestamp, 1)
+				// RTM:
+				// Successful reservation
+				//r1delay := r1.Delay()
+				if r1.Delay() == 0 {
+				//if r1delay == 0 {
+					//RTM.dtb test only
+					if bytes.HasPrefix(msg.Body[24:], []byte{'0'}) {
+						//curx:=time.Now().UnixNano()
+						binary.PutVarint(msg.Body[60:], time.Now().UnixNano())
+						//binary.PutVarint(msg.Body[40:], curx)
+						//strx := []byte(strconv.Itoa(0))
+						/*then1, _:=binary.Varint(msg.Body[40:58])
+                                        	strx := []byte(strconv.Itoa(int(time.Now().UnixNano()-then1)))
+						strx = append(strx, "\n"...)
+						strx = append(strx, []byte(strconv.Itoa(int(then1-msg.Ktimestamp.UnixNano())))...)
+                                        	strx = append(strx, "\n"...)
+						copy(msg.Body[60:], strx)*/
+					}
+					if t.congest &&
+						len(t.memMsgChan) < int(float64(cap(t.memMsgChan))*0.3) {
+						//copy(msg.Body[50:], []byte("decongest_sent"))
+						//binary.PutVarint(msg.Body[70:], time.Now().UnixNano())
+						t.congest = false
+						fmt.Printf("~~~~~~~~!!!!! Decongest\n")
+						t.clientLock.RLock()
+						for _, v := range t.clients {
+							select {
+							case v.DeCongestChan <- t.name:
+							default:
+							}
+						}
+						t.clientLock.RUnlock()
+					}
+					goto send
+				}
+				// RTM:
+				// There is no enough token. Topic enters congestion mode.
+				// In congestion mode, Topic sleeps until its own timer expires.
+				// The timer expiration is configured based on the number of
+				// pending msgs and the burst that our rate limiter supports.
+				t.Tmpindex=0
+				t.Tmpq[t.Tmpindex]=msg
+				t.Tmpindex++
+				reserve = len(t.memMsgChan)
+				if reserve >= 1 {
+					if reserve > t.quantum-1 {
+						reserve = t.quantum-1
+					}
+					for x:= 0; x<reserve; x++ {
+						t.Tmpq[t.Tmpindex]=<-t.memMsgChan
+						t.Tmpindex++
+					}
+					rN := t.bucket.ReserveN(t.Tmpq[t.Tmpindex-1].Ktimestamp, reserve)
+					delay = rN.Delay()
+					//delay = rN.DelayFrom(t.Tmpq[t.Tmpindex-1].Ktimestamp)
+				} else {
+					delay = r1.Delay()
+					//delay = r1delay
+				}
+				//delay=r1.Delay()
+				t.congestLock.Lock()
+				t.congestion = true
+				t.congestLock.Unlock()
+				//fmt.Println("delay !!!!!!!!!!!!!!!", t.bucket.Limit(), t.bucket.Burst())
+				//x1 := time.Now().Add(delay)
+				//x1Flag = true
+				//adj:=time.Now().Sub(msg.Ktimestamp)
+				//time.Sleep(delay+adj)
+				/*if bytes.HasPrefix(msg.Body[24:], []byte{'0'}) {
+                                        //binary.PutVarint(msg.Body[40:], time.Now().UnixNano())
+					then1, _:=binary.Varint(msg.Body[40:58])
+					strx := []byte(strconv.Itoa(int(time.Now().UnixNano()-then1)))
+                                        strx = append(strx, "\n"...)
+					strx = append(strx, []byte(strconv.Itoa(int(then1-msg.Ktimestamp.UnixNano())))...)
+					strx = append(strx, "\n"...)
+                                        copy(msg.Body[60:], strx)
+
+                                }*/
+				time.Sleep(delay)
+				reserve = 0
+				select {
+				case t.limiterChan <- 1:
+				default:
+				}
+				/*go func() {
+					time.Sleep(delay)
+					reserve = 0
+					select {
+					case t.limiterChan <- 1:
+					default:
+					}
+				}()*/
+			}
+			continue
+		}
+	send:
+		if len(chans) >= 1 {
+			//chanIndex = (chanIndex + 1) % len(chans)
+			chanIndex = int(msg.senderID)%len(chans)
+			channel := chans[chanIndex]
+			chanMsg := msg
+			if chanMsg.deferred != 0 {
+				channel.StartDeferredTimeout(chanMsg, chanMsg.deferred)
+				goto sig
+			}
+			err := channel.PutMessage(chanMsg)
+			if err != nil {
+				t.ctx.nsqd.logf(
+					"TOPIC(%s) ERROR: failed to put msg(%s) to channel(%s) - %s",
+					t.name, msg.ID, channel.name, err)
+			}
+			//RTM.dtbt
+			//binary.PutVarint(msg.Body[160:], time.Now().UnixNano())
+			goto sig
+		}
+		for i, channel := range chans {
+			chanMsg := msg
+			// copy the message because each channel
+			// needs a unique instance but...
+			// fastpath to avoid copy if its the first channel
+			// (the topic already created the first copy)
+			if i > 0 {
+				chanMsg = NewMessage(msg.ID, msg.Body)
+				chanMsg.Timestamp = msg.Timestamp
+				chanMsg.deferred = msg.deferred
+			}
+			if chanMsg.deferred != 0 {
+				channel.StartDeferredTimeout(chanMsg, chanMsg.deferred)
+				continue
+			}
+			//RTM.dtb test only
+			/*if bytes.HasPrefix(chanMsg.Body[24:], []byte{'0'}) {
+				lenByte := []byte(strconv.Itoa(len(channel.memoryMsgChan)))
+				lenByte = append(lenByte, "\n"...)
+				copy(chanMsg.Body[100:], lenByte)
+			}*/
+			//if bytes.HasPrefix(chanMsg.Body[24:], []byte{'0'}) {
+			//for ss:=0;ss<250000;ss++ {
+			err := channel.PutMessage(chanMsg)
+			//chanMsg = NewMessage(<-t.ctx.nsqd.idChan, msg.Body)
+			//chanMsg.Timestamp = msg.Timestamp
+			//chanMsg.deferred = msg.deferred
+			if err != nil {
+				t.ctx.nsqd.logf(
+					"TOPIC(%s) ERROR: failed to put msg(%s) to channel(%s) - %s",
+					t.name, msg.ID, channel.name, err)
+			}
+			//RTM.dtbt
+			//binary.PutVarint(msg.Body[160:], time.Now().UnixNano())
+		}
+	sig:
+		// RTM
+		if reserve < t.Tmpindex {
+			/*go func() {
+				select {
+				case t.limiterChan <- 1:
+				default:
+				}
+			}()*/
+			select {
+		        case t.limiterChan <- 1:
+			default:
+			}
+		} else {
+			if t.congestion == true {
+				t.congestLock.Lock()
+				t.congestion = false
+				t.congestLock.Unlock()
+			}
+			if len(t.memMsgChan) > 0 {
+				/*go func() {
+					select {
+					case t.pullChan <- 1:
+					default:
+					}
+				}()*/
+				select {
+				case t.pullChan <- 1:
+				default:
+				}
+			}
+		}
+	}
+
+exit:
+	t.ctx.nsqd.logf("TOPIC(%s): closing ... messagePump", t.name)
+}
+
+// Delete empties the topic and all its channels and closes
+func (t *Topic) Delete() error {
+	return t.exit(true)
+}
+
+// Close persists all outstanding topic data and closes all its channels
+func (t *Topic) Close() error {
+	return t.exit(false)
+}
+
+func (t *Topic) exit(deleted bool) error {
+	if !atomic.CompareAndSwapInt32(&t.exitFlag, 0, 1) {
+		return errors.New("exiting")
+	}
+
+	if deleted {
+		t.ctx.nsqd.logf("TOPIC(%s): deleting", t.name)
+
+		// since we are explicitly deleting a topic (not just at system exit time)
+		// de-register this from the lookupd
+		t.ctx.nsqd.Notify(t)
+	} else {
+		t.ctx.nsqd.logf("TOPIC(%s): closing", t.name)
+	}
+
+	close(t.exitChan)
+
+	// synchronize the close of messagePump()
+	t.waitGroup.Wait()
+
+	if deleted {
+		t.Lock()
+		for _, channel := range t.channelMap {
+			delete(t.channelMap, channel.name)
+			channel.Delete()
+		}
+		t.Unlock()
+
+		// empty the queue (deletes the backend files, too)
+		t.Empty()
+		return t.backend.Delete()
+	}
+
+	// close all the channels
+	for _, channel := range t.channelMap {
+		err := channel.Close()
+		if err != nil {
+			// we need to continue regardless of error to close all the channels
+			t.ctx.nsqd.logf("ERROR: channel(%s) close - %s", channel.name, err)
+		}
+	}
+
+	// write anything leftover to disk
+	t.flush()
+	return t.backend.Close()
+}
+
+func (t *Topic) Empty() error {
+	for {
+		select {
+		case <-t.memoryMsgChan:
+		default:
+			goto finish
+		}
+	}
+
+finish:
+	return t.backend.Empty()
+}
+
+func (t *Topic) flush() error {
+	var msgBuf bytes.Buffer
+
+	if len(t.memoryMsgChan) > 0 {
+		t.ctx.nsqd.logf(
+			"TOPIC(%s): flushing %d memory messages to backend",
+			t.name, len(t.memoryMsgChan))
+	}
+
+	for {
+		select {
+		case msg := <-t.memoryMsgChan:
+			err := writeMessageToBackend(&msgBuf, msg, t.backend)
+			if err != nil {
+				t.ctx.nsqd.logf(
+					"ERROR: failed to write message to backend - %s", err)
+			}
+		default:
+			goto finish
+		}
+	}
+
+finish:
+	return nil
+}
+
+func (t *Topic) AggregateChannelE2eProcessingLatency() *quantile.Quantile {
+	var latencyStream *quantile.Quantile
+	t.RLock()
+	realChannels := make([]*Channel, 0, len(t.channelMap))
+	for _, c := range t.channelMap {
+		realChannels = append(realChannels, c)
+	}
+	t.RUnlock()
+	for _, c := range realChannels {
+		if c.e2eProcessingLatencyStream == nil {
+			continue
+		}
+		if latencyStream == nil {
+			latencyStream = quantile.New(
+				t.ctx.nsqd.getOpts().E2EProcessingLatencyWindowTime,
+				t.ctx.nsqd.getOpts().E2EProcessingLatencyPercentiles)
+		}
+		latencyStream.Merge(c.e2eProcessingLatencyStream)
+	}
+	return latencyStream
+}
+
+func (t *Topic) Pause() error {
+	return t.doPause(true)
+}
+
+func (t *Topic) UnPause() error {
+	return t.doPause(false)
+}
+
+func (t *Topic) doPause(pause bool) error {
+	if pause {
+		atomic.StoreInt32(&t.paused, 1)
+	} else {
+		atomic.StoreInt32(&t.paused, 0)
+	}
+
+	select {
+	case t.pauseChan <- pause:
+	case <-t.exitChan:
+	}
+
+	return nil
+}
+
+func (t *Topic) IsPaused() bool {
+	return atomic.LoadInt32(&t.paused) == 1
+}

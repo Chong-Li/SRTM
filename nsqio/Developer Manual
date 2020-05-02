@@ -1,0 +1,121 @@
+The design of rate control is introduced in WashU-Report-9-26.
+
+
+The main implementation of rate control includes:
+In messaging daemon:
+* nsqio/nsq/nsqd/client_v2.go:
+  * definition of struct clientV2
+  * func newClientV2()
+* nsqio/nsq/nsqd/topic.go:
+  * definition of struct Topic
+  * func NewTopic()
+  * func messagePump()
+* nsqio/nsq/nsqd/protocol_v2.go:
+  * func PUB()
+  * func messagePump()
+
+In client library:
+* nsqio/go-nsq/producer.go:
+  * definition of struct Producer
+  * func sendCommandAsync()
+  * func router()
+  * func congestHandler()
+  * func decongestHandler()
+
+
+Detailed explanation:
+In messaging daemon:
+* In the definition of clientV2 (nsqio/nsq/nsqd/client_v2.go):
+  * Add a multi-queue structure (MsgQ)
+  * Add a map to specify the congestion status of all topics going through
+    this client
+  * Add a channel to receive De-Congestion notification from Topic.messagePump
+
+* In the definition of Topic (nsqio/nsq/nsqd/topic.go):
+  * Add a rate limiter
+  * Add a channel to receive notification from Client.IOLoop
+  * Add a channel for message sending during congestion period
+  * Add a list to maintain all clients that are handling this topic
+  * Add a boolean variable to specify the congestion status of this topic
+
+* In func NewTopic() (nsqio/nsq/nsqd/topic.go):
+  * Configure the token bucket parameters for rate limiting
+
+* In func PUB() (nsqio/nsq/nsqd/protocol_v2.go):
+  * Push messages into corresponding queues
+    * For a new topic, create a new queue
+      * Queue capacity can be re-configured by developer
+  * Wake up Topic.messagePump when topic is not in congestion status
+  * If queue length exceeds high-watermark, send a congestion
+   signal (for one specific topic) to producer
+    * High-watermark can be re-configured by developer
+
+* In func messagePump() (nsqio/nsq/nsqd/topic.go):
+  * Pull messages from related Client queues in a round-robin order
+  * If queue length becomes lower than low-watermark, send de-congestion
+    notification to Client.messagePump
+    * Low-watermark can be re-configured by developer
+  * Rate limiting is enforced in this function
+
+* In func messagePump() (nsqio/nsq/nsqd/protocol_v2.go):
+  * When receiving de-congestion notification from Topic.messagePump, send
+    a de-congestion signal (for one specific topic) to producer
+
+In client library:
+* In the definition of producer (nsqio/go-nsq/producer.go):
+  * Add a multi-queue structure
+  * Add a map to specify the congestion status of all topics going through this
+    producer
+  * Add a channel to receive wakeup signal from user Goroutine
+
+* In func sendCommandAsync() (nsqio/go-nsq/producer.go):
+  * Push messages to corresponding queues
+    * For a new topic, create a new queue
+      * Queue capacity can be re-configured by developer
+  * Wake up producer.router when topic is not in congestion status
+
+* In func router() (nsqio/go-nsq/producer.go):
+  * Pull and send messages from different queues (corresponding to
+    un-congested topics) in a round-robin order
+  * When receiving congestion signal from messaging daemon:
+    * Label the corresponding topic as congestion status
+  * When receiving de-congestion signal from messaging daemon:
+    * Label the corresponding topic as un-congested status
+    * Try to pull and send messages
+
+
+*******************************************************************************
+*******************************************************************************
+
+RTM provids NSQd lookup for producers
+
+Preset producer priority, and connect it to a corresponding nsqd
+API:
+//to find a nsqd for a certain prio
+producer1, _ := nsq.NewProducer("", config)
+err := producer1.ConnectToNSQLookupd_v2(Lookupd_Address, ProducerPriorityLevel:"HIGH"/“LOW”)
+err = producer1.Publish(Topic1, MessageBody)
+err = producer1.Publish(Topic2, MessageBody)
+
+Explanation:
+This protocol links the producer to the nsqd with the required priority. 
+Once connection is set up, the producer will not switch to another nsqd unless nsqd dies out.
+If nsqd dies out, the producer will get a connection error.
+This behavior is the original nsq producer behavior.
+
+* In the definition of the nsqdameon
+ * add a parameter called priority. It can be either "LOW" or "HIGH"
+ 
+* In producer.go (nsqio/go-nsq/producer.go):
+ * add an extra function called ConnectToNSQLookupd_v2.
+
+* In http.go (nsqio/nsq/nsqlookupd/http.go)
+ * add an extra function called doProducerLookupV2
+
+
+
+
+
+
+
+
